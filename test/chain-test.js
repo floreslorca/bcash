@@ -16,6 +16,7 @@ const MemWallet = require('./util/memwallet');
 const Network = require('../lib/protocol/network');
 const Output = require('../lib/primitives/output');
 const common = require('../lib/blockchain/common');
+const util = require('../lib/utils/util');
 const Opcode = require('../lib/script/opcode');
 const opcodes = Script.opcodes;
 
@@ -47,6 +48,8 @@ const cpu = miner.cpu;
 const wallet = new MemWallet({
   network
 });
+
+const MAA = network.block.magneticAnomalyActivationTime;
 
 let tip1 = null;
 let tip2 = null;
@@ -167,6 +170,10 @@ describe('Chain', function() {
   it('should open chain and miner', async () => {
     await chain.open();
     await miner.open();
+
+    // use some time in the future for maa activation
+    // test should not take more than HOUR
+    network.block.magneticAnomalyActivationTime = util.now() + 3600;
   });
 
   it('should add addrs to miner', async () => {
@@ -930,12 +937,12 @@ describe('Chain', function() {
   it('should not mine block with tx smaller than MIN_TX_SIZE', async () => {
     // Send some money to script
     const [fund, spend] = await spendTX(consensus.MIN_TX_SIZE - 1, true, true);
-
     const job = await cpu.createJob();
 
     // push fund tx
     job.pushTX(fund.toTX(), fund.view);
     job.pushTX(spend.toTX(), spend.view);
+    job.sort();
     job.refresh();
 
     assert.strictEqual(await mineBlock(job), 'bad-txns-undersize');
@@ -949,6 +956,7 @@ describe('Chain', function() {
 
     job.pushTX(fund.toTX(), fund.view);
     job.pushTX(spend.toTX(), spend.view);
+    job.sort();
     job.refresh();
 
     assert.strictEqual(await mineBlock(job),
@@ -963,6 +971,7 @@ describe('Chain', function() {
 
     job.pushTX(fund.toTX(), fund.view);
     job.pushTX(spend.toTX(), spend.view);
+    job.sort();
     job.refresh();
 
     assert.strictEqual(await mineBlock(job),
@@ -975,12 +984,66 @@ describe('Chain', function() {
 
     job.pushTX(fund.toTX(), fund.view);
     job.pushTX(spend.toTX(), spend.view);
+    job.sort();
     job.refresh();
 
     assert.strictEqual(await mineBlock(job), 'OK');
   });
 
+  it('should not accept non-sorted block', async () => {
+    const txs = await spendTX(200, true, true);
+    const job = await cpu.createJob();
+
+    // sort in reverse order
+    txs.sort((a, b) => a.txid() > b.txid() ? -1 : 1);
+
+    for (const tx of txs)
+      job.pushTX(tx.toTX(), tx.view);
+
+    job.refresh();
+
+    assert.strictEqual(await mineBlock(job), 'tx-ordering');
+  });
+
+  it('should mine sorted block', async () => {
+    const tip = chain.tip;
+    const job = await cpu.createJob();
+
+    for (let i = 0; i < 10; i++) {
+      const txs = await spendTX(200, true, true);
+
+      job.pushTX(txs[0].toTX(), txs[0].view);
+      job.pushTX(txs[1].toTX(), txs[1].view);
+
+      // make sure we don't reuse coins.
+      wallet.addTX(txs[0]);
+      wallet.addTX(txs[1]);
+    }
+
+    job.sort();
+    job.refresh();
+
+    assert.strictEqual(await mineBlock(job), 'OK');
+
+    let forked = false;
+    chain.once('reorganize', () => {
+      forked = true;
+    });
+
+    const block = await cpu.mineBlock(tip);
+    assert(await chain.add(block));
+
+    const entry = await chain.getEntry(block.hash());
+    const block2 = await cpu.mineBlock(entry);
+
+    assert(await chain.add(block2));
+
+    assert(forked);
+    assert.bufferEqual(block2.hash(), chain.tip.hash);
+  });
+
   it('should cleanup', async () => {
+    network.block.magneticAnomalyActivationTime = MAA;
     await miner.close();
     await chain.close();
   });
